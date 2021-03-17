@@ -1,40 +1,23 @@
-function C = eul2m(eul)
-%eul2dcm - Converts a set of Euler angles to the corresponding
-%coordinate transformation matrix
+function [Cb2n_312, Cb2n_321] = ch_eul2m(att)
+% 将欧拉角转换为姿态阵
+% 复用严龚敏老师的a2mat
 %
-% Software for use with "Principles of GNSS, Inertial, and Multisensor
-% Integrated Navigation Systems," Second Edition.
-%
-% This function created 1/4/2012 by Paul Groves
-%
-% Inputs:
-%   eul     Euler angles describing rotation from beta to alpha in the 
-%           order roll, pitch, yaw(rad)
-%
-% Outputs:
-%   C       coordinate transformation matrix describing transformation from
-%           beta to alpha
+% Input: att  单位：rad
+% 对于312((Z->X->Y))顺序，对应att = [pitch(绕X轴) roll(绕Y轴)  yaw(绕Z轴)]
+% 对于3211(Z->Y->X)顺序，对应att = [roll(绕X轴) pitch(绕Y轴)  yaw(绕Z轴)]
+% Outputs: 
+% Cb2n_312:  312欧拉角顺序下转换后的Cb2n
+% Cb2n_321:  321欧拉角顺序下转换后的Cb2n
 
-
-% Begins
-
-% Precalculate sines and cosines of the Euler angles
-sin_phi = sin(eul(1));
-cos_phi = cos(eul(1));
-sin_theta = sin(eul(2));
-cos_theta = cos(eul(2));
-sin_psi = sin(eul(3));
-cos_psi = cos(eul(3));
-
-% Calculate coordinate transformation matrix using (2.22)
-C(1,1) = cos_theta * cos_psi;
-C(1,2) = cos_theta * sin_psi;
-C(1,3) = -sin_theta;
-C(2,1) = -cos_phi * sin_psi + sin_phi * sin_theta * cos_psi;
-C(2,2) = cos_phi * cos_psi + sin_phi * sin_theta * sin_psi;
-C(2,3) = sin_phi * cos_theta;
-C(3,1) = sin_phi * sin_psi + cos_phi * sin_theta * cos_psi;
-C(3,2) = -sin_phi * cos_psi + cos_phi * sin_theta * sin_psi;
-C(3,3) = cos_phi * cos_theta;
-
-% Ends
+    s = sin(att); c = cos(att);
+    si = s(1); sj = s(2); sk = s(3); 
+    ci = c(1); cj = c(2); ck = c(3);
+    Cb2n_312 = [ cj*ck-si*sj*sk, -ci*sk,  sj*ck+si*cj*sk;
+            cj*sk+si*sj*ck,  ci*ck,  sj*sk-si*cj*ck;
+           -ci*sj,           si,     ci*cj           ];
+    if nargout==2  % dual Euler angle DCM
+        Cb2n_321 = [ cj*ck, si*sj*ck-ci*sk, ci*sj*ck+si*sk;
+                 cj*sk, si*sj*sk+ci*ck, ci*sj*sk-si*ck;
+                -sj,    si*cj,          ci*cj            ];
+    end
+    
