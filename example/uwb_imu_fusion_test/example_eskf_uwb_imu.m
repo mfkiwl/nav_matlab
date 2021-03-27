@@ -2,42 +2,36 @@ clc
 clear
 close all
 
+%% 说明
+% UWB IMU 融合算法，采用误差卡尔曼15维经典模型，伪距组合
+
+% noimal_state:     位置(3) 速度(3) 四元数(4) 共10维
+% err_state:           位置误差(3) 速度误差(3) 失准角(3) 加速度计零偏(3) 陀螺零偏(3) 共15维
+% du:                    加速度计零偏(3) 陀螺零偏(3)
 
 %% Motion Process, Measurement model and it's derivative
 h_func = @uwb_h;
 dh_dx_func = @err_uwb_h;
 
-%N = size(u,2);
-imu_iter = 1;
-uwb_iter = 1;
-ISPUTCHAR = 0;
 
 %% load data set
-load dataset2;
+%load dataset2;
+load datas;
+dataset = datas;
 
-dt = dataset.imu.time(2) - dataset.imu.time(1);
+N = length(dataset.imu.time);
+dt = sum(diff(dataset.imu.time)) / N;
 
-section = [5000  7000]*4;
+dataset.uwb.cnt = 4;
+%dataset.uwb.anchor = [dataset.uwb.anchor; [ 1.01 1 1 1]];
 
-u = [dataset.imu.acc; dataset.imu.gyr];
+uwb_noise = 0.05;  % UWB测距噪声
 
-u = u(:,section(1) :section(2));
+R = diag(ones(dataset.uwb.cnt, 1)*uwb_noise^(2));
+p_div_cntr = 0; % 预测频率器，目前没有用
+m_div_cntr = 0; %量测分频器
+m_div = 50;  %每m_div次量测，才更新一次KF, 节约计算量或者做实验看效果
 
-dataset.imu.time = dataset.imu.time(1,section(1) :section(2));
-dataset.uwb.time =  dataset.uwb.time(1,section(1)/4 :section(2)/4);
-dataset.uwb.tof = dataset.uwb.tof(:,section(1)/4 : section(2)/4);
-
-dataset.uwb.anchor = [dataset.uwb.anchor(:,1:5); [0.01 0 0 0 0]];
-dataset.uwb.cnt = 5;
-N = length(u);
-
-MeasureNoiseVariance = [2.98e-03, 2.9e-03,1.8e-03, 1.2e-03, 2.4e-03];  %%%%  UWB Ranging noise
-
-R = diag(MeasureNoiseVariance(1:dataset.uwb.cnt));
-p_div = 0;
-
-%% 打印原始数据
-ch_plot_imu('time', 1:length(dataset.imu.acc), 'acc', dataset.imu.acc' / 9.8, 'gyr', rad2deg(dataset.imu.gyr'));
 
 %% out data init
 out_data.uwb = [];
@@ -46,62 +40,82 @@ out_data.imu.time = dataset.imu.time;
 out_data.uwb.anchor = dataset.uwb.anchor;
 
 %% load settings
-settings = gnss_imu_local_tan_example_settings();
+settings = uwb_imu_example_settings();
 noimal_state = init_navigation_state(settings);
-delta_u_h = zeros(6, 1);
+
+%使用第一帧伪距作为初始状态
+pr = dataset.uwb.tof(:, 1);
+noimal_state(1:3) = ch_multilateration(dataset.uwb.anchor, [ 0 0 0]',  pr');
+
+du = zeros(6, 1);
 [P, Q1, Q2, ~, ~] = init_filter(settings);
 
+fprintf("共%d数据, 频率:%d Hz\n", N,  1 / dt);
 
+fprintf("开始融合...\n");
 for k=1:N
-   
-    u_h = u(:,k);
     
-     % 反馈
-    u_h = u_h + delta_u_h;
+    acc = dataset.imu.acc(:,k);
+    gyr = dataset.imu.gyr(:,k);
+    
+    % 反馈
+    acc = acc + du(1:3);
+    gyr = gyr + du(4:6);
     
     % 捷联惯导
-	[noimal_state(1:3), noimal_state(4:6), noimal_state(7:10)] = ch_nav_equ_local_tan(noimal_state(1:3), noimal_state(4:6), noimal_state(7:10), u_h(1:3), u_h(4:6), dt, [0, 0, 9.7803698]');
+    pos = noimal_state(1:3);
+    vel = noimal_state(4:6);
+    q =  noimal_state(7:10);
+    
+    [pos, vel, q] = ch_nav_equ_local_tan(pos, vel, q, acc, gyr, dt, [0, 0, 9.8]');
+    
+    %Z方向速度限制
+    vel(3) = 0;
+    
+    noimal_state(1:3) = pos;
+    noimal_state(4:6) = vel;
+    noimal_state(7:10) = q;
+    out_data.eul(k,:) = ch_q2eul(q);
+    
+    p_div_cntr = p_div_cntr+1;
+    if p_div_cntr == 1
+        % 生成F阵   G阵
+        [F, G] = state_space_model(noimal_state, acc, dt*p_div_cntr);
         
-    p_div = p_div+1;
-    if p_div == 1
-        %Get state space model matrices
-        [F, G] = state_space_model(noimal_state, u_h, dt*p_div);
-        
-        %Time update of the Kalman filter state covariance.
+        %卡尔曼P阵预测公式
         P = F*P*F' + G*blkdiag(Q1, Q2)*G';
-        p_div = 0;
+        p_div_cntr = 0;
     end
     
-    if ISPUTCHAR == 1
-        cprintf('text', 'time: %8.3f s, Position = [%0.2f %0.2f %0.2f] m, Velocity = [%0.3f %0.3f %0.3f] m/s Position Variance = [%0.5f %0.5f %0.5f], Velocity Variance = [%0.5f %0.5f %0.5f]m/s^2\n',...
-            dataset.imu.time(imu_iter) ,X(1),X(2),X(3),X(4),X(5),X(6), P(1,1),P(2,2),P(3,3),P(4,4),P(5,5),P(6,6));
-    end
     
     
     %% EKF UWB量测更新
-    if uwb_iter < length(dataset.uwb.time)  && abs(dataset.imu.time(imu_iter) - dataset.uwb.time(uwb_iter))  < 0.01
+    m_div_cntr = m_div_cntr+1;
+    if m_div_cntr == m_div
+        m_div_cntr = 0;
         
-        y = dataset.uwb.tof(:,uwb_iter);
-        y = y(1:dataset.uwb.cnt);
+        
+        %  pr = dataset.uwb.tof(:,k);
+        pr = mean(dataset.uwb.tof(:,k-3 : k),2);
         
         % bypass Nan
-        if sum(isnan(y)) == 0
+        if sum(isnan(pr)) == 0
             [~,H] = dh_dx_func(noimal_state, dataset.uwb);
             
-            % Calculate the Kalman filter gain.
-            K=(P*H')/(H*P*H'+R);
+            % 卡尔曼公式，计算K
+            K = (P*H')/(H*P*H'+R);
             
             % NLOS elimation
-            t = h_func(noimal_state, dataset.uwb);
-            if uwb_iter > 50
-                for i = 1:length(y)
-                    if abs(y(i) - t(i))  > 0.9
-                        y(i) = t(i); %丢弃这次量测，直接认为这次量测就是预测误差
-                    end
-                end
-            end
+            % t = h_func(noimal_state, dataset.uwb);
+            %             if uwb_iter > 50
+            %                 for i = 1:length(y)
+            %                     if abs(y(i) - t(i))  > 0.9
+            %                         y(i) = t(i); %丢弃这次量测，直接认为这次量测就是预测误差
+            %                     end
+            %                 end
+            %             end
             
-            err_state = [zeros(9,1); delta_u_h] + K*(y - h_func(noimal_state, dataset.uwb));
+            err_state = [zeros(9,1); du] + K*(pr - h_func(noimal_state, dataset.uwb));
             
             % 反馈速度位置
             noimal_state(1:6) = noimal_state(1:6) + err_state(1:6);
@@ -112,60 +126,112 @@ for k=1:N
             q = ch_qconj(q);
             noimal_state(7:10) = q;
             
-            delta_u_h = err_state(10:15);
+            %存储加速度计零偏，陀螺零偏
+            du = err_state(10:15);
             
-            % Update the Kalman filter state covariance.
-            P=(eye(15)-K*H)*P;
-            
-            if ISPUTCHAR == 1
-                cprintf('err', 'time: %8.3f s, Position [%0.2f %0.2f %0.2f] m, Velocity [%0.3f %0.3f %0.3f] m/s Position Variance = [%0.5f %0.5f %0.5f], Velocity Variance = [%0.5f %0.5f %0.5f]m/s^2\n\n\n',...
-                    dataset.uwb.time(uwb_iter) ,X(1),X(2),X(3),X(4),X(5),X(6), P(1,1),P(2,2),P(3,3),P(4,4),P(5,5),P(6,6));
-            end
+            % P阵后验更新
+            P = (eye(15)-K*H)*P;
         end
-        uwb_iter = uwb_iter + 1;
     end
     
     out_data.x(k,:)  = noimal_state;
-    out_data.delta_u(k,:) = delta_u_h';
+    out_data.delta_u(k,:) = du';
     out_data.diag_P(k,:) = trace(P);
-    imu_iter = imu_iter + 1;
 end
 
 %% 纯 UWB 位置解算
-cnt = 1;
-uwbxyz = [1 2 3]';
+j = 1;
+uwb_pos = [0 0 0]';
+N = length(dataset.uwb.time);
 
-for uwb_iter=1:length(dataset.uwb.time)
-    y = dataset.uwb.tof(:, uwb_iter);
+for i=1:N
+    pr = dataset.uwb.tof(:, i);
     % 去除NaN点
-    if all(~isnan(y)) == true
-        uwbxyz = ch_multilateration(dataset.uwb.anchor, uwbxyz,  y');
-        out_data.uwb.pos(:,cnt) = uwbxyz;
-         cnt = cnt+1;
+    if all(~isnan(pr)) == true
+        
+        uwb_pos = ch_multilateration(dataset.uwb.anchor, uwb_pos,  pr');
+        out_data.uwb.pos(:,j) = uwb_pos;
+        j = j+1;
     end
-
 end
 
 
-%% show all data
+%% plot 数据
 out_data.uwb.tof = dataset.uwb.tof;
 out_data.uwb.fusion_pos = out_data.x(:,1:3)';
 
-fusion_display(out_data, []);
+% fusion_display(out_data, []);
+
+
+%% 打印原始数据
+figure;
+subplot(2, 2, 1);
+plot(dataset.imu.acc');
+legend("X", "Y", "Z");
+title("加速度测量值");
+subplot(2, 2, 2);
+plot(dataset.imu.gyr');
+legend("X", "Y", "Z");
+title("陀螺测量值");
+subplot(2, 2, 3);
+plot(dataset.uwb.tof');
+title("UWB测量值(伪距)");
+
+
+
+figure;
+subplot(2,1,1);
+plot(out_data.delta_u(:,1:3));
+legend("X", "Y", "Z");
+title("加速度零偏");
+subplot(2,1,2);
+plot(rad2deg(out_data.delta_u(:,4:6)));
+legend("X", "Y", "Z");
+title("陀螺仪零偏");
+
+figure;
+subplot(2,2,1);
+plot(out_data.x(:,1:3));
+legend("X", "Y", "Z");
+title("位置");
+subplot(2,2,2);
+plot(out_data.x(:,4:6));
+legend("X", "Y", "Z");
+title("速度");
+subplot(2,2,3);
+plot(out_data.eul);
+legend("X", "Y", "Z");
+title("欧拉角(姿态)");
+
+
+figure;
+plot3(out_data.uwb.pos(1,:), out_data.uwb.pos(2,:), out_data.uwb.pos(3,:), '.');
+title("UWB 伪距解算位置");
+
+figure;
+plot(out_data.uwb.pos(1,:), out_data.uwb.pos(2,:), '.');
+hold on;
+plot(out_data.uwb.fusion_pos(1,:), out_data.uwb.fusion_pos(2,:), '.-');
+legend("伪距解算UWB轨迹", "融合轨迹");
+
+figure;
+plot(datas.pos(1,:), datas.pos(2,:), '.');
+hold on;
+plot(out_data.uwb.fusion_pos(1,:), out_data.uwb.fusion_pos(2,:), '.-');
+legend("硬件给出轨迹", "融合轨迹");
+
+
 
 %%  Init navigation state
-function x = init_navigation_state(settings)
+function x = init_navigation_state(~)
 
-roll = 0;
-pitch = 0;
-
-% Initial coordinate rotation matrix
-q = ch_eul2q([roll pitch settings.init_heading]);
+% 初始化normial state
+q = ch_eul2q(deg2rad([0 0 0]));
 x = [zeros(6,1); q];
 end
 
 
-%%  Init filter
+%% 初始化滤波器参数
 function [P, Q1, Q2, R, H] = init_filter(settings)
 
 % Kalman filter state matrix
@@ -190,28 +256,30 @@ H = 0;
 
 end
 
-%%  State transition matrix
-function [F,G] = state_space_model(x, u, t)
+%%  生成F阵，G阵
+function [F,G] = state_space_model(x, acc, dt)
 Cb2n = ch_q2m(x(7:10));
 
 % Transform measured force to force in the tangent plane coordinate system.
-sf = Cb2n * u(1:3);
-St = ch_askew(sf);
+sf = Cb2n * acc;
+sk = ch_askew(sf);
 
 % Only the standard errors included
 O = zeros(3);
 I = eye(3);
-F = [ O I   O O       O;
-    O O St Cb2n O;
+F = [
+    O I   O O       O;
+    O O sk Cb2n O;
     O O O O       -Cb2n;
     O O O O       O;
     O O O O       O];
 
 % Approximation of the discret  time state transition matrix
-F = eye(15) + t*F;
+F = eye(15) + dt*F;
 
 % Noise gain matrix
-G=t*[O       O         O  O;
+G=dt*[
+    O       O         O  O;
     Cb2n  O         O  O;
     O        -Cb2n O  O;
     O        O         I   O;
