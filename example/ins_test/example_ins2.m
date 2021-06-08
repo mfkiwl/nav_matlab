@@ -3,29 +3,16 @@ clear;
 clc;
 close all;
 
-%%
+%% 
 Fs = 100;
 
-%% EXAMPLE 2.3 Calculation of Gravity at various latitudes and heights
-lat = deg2rad(31.508183);
-lon =120.401989;
-hgt = 0;
-
-[~, ~, ~, ~, gravity]= ch_earth(lat, lon, hgt);
-%gravity = 9.80235145615448;
-
-
 %% GNSS-SIM仿真软件真值(gt= groud true,真实值)
-pos_gt = csvread('generated_data/ref_pos.csv', 1, 0);
-pos_gt = pos_gt - pos_gt(1,:);
-att_gt =  csvread('generated_data/ref_att_euler.csv', 1, 0);
-vel_gt =  csvread('generated_data/ref_vel.csv', 1, 0);
+% 使用 https://github.com/Aceinna/gnss-ins-sim 生成仿真数据
 
-%%单位:  m/s^(2), deg/s
- acc = csvread('generated_data/accel-0.csv', 1, 0);
- gyr = csvread('generated_data/gyro-0.csv', 1, 0);
+ %%单位:  ACC: m/s^(2),  GYR: rad/s
+ load example_ins2.mat;
+ 
 
-gyr = deg2rad(gyr);
 N = length(acc);
 
 % 惯导解算, 初始化
@@ -33,36 +20,29 @@ p = zeros(3, 1);
 v = zeros(3, 1);
 q= [1 0 0 0]';
 
-gravity = 9.79444435359668;
 
 for i=1:N
-    [p ,v , q] = ch_nav_equ_local_tan(p, v, q, acc(i,:)', gyr(i,:)', 1 / Fs, [0, 0, gravity]');
-    pos(i,:) = p;
-    att(i,:) = rad2deg(ch_q2eul(q))';
-    vel(i,:) = v;
+    [p ,v , q] = ch_nav_equ_local_tan(p, v, q, acc(i,:)', gyr(i,:)', 1 / Fs, [0, 0, 9.8]');
+    h_pos(i,:) = p;
+    h_att(i,:) = rad2deg(ch_q2eul(q))';
+    h_vel(i,:) = v;
+    h_eul(i,:) = ch_q2eul(q);
 end
 
 figure;
-subplot(2,1,1);
-plot(acc);
-title("ACC");
-legend("X", "Y", "Z");
-
-subplot(2,1,2);
-plot(gyr);
-title("GYR");
-legend("X", "Y", "Z");
+subplot(2,2,1);
+ch_plot_pos3d(h_pos);
+subplot(2,2,2);
+ch_plot_pos2d(h_pos);
+subplot(2,2,3);
+ch_plot_att(h_eul);
 
 figure;
 plot(pos_gt(:,1), pos_gt(:,2), '.r');
 hold on;
-plot(pos(:,1), pos(:,2), '.g');
-legend("GT", "解算结果");
+plot(h_pos(:,1), h_pos(:,2), '.g');
+legend("Groud True", "解算结果");
 title("平面位置");
 
-% 
-%  ch_plot_pos3d( 'p1', pos_gt, 'p3', pos, 'legend', ["GNSS-SIM真值", "matlab仿真结果"]);
-%  ch_plot_pos2d( 'p1', pos_gt, 'p3', pos, 'legend', ["GNSS-SIM真值", "matlab仿真结果"]);
 
-
-fprintf('总时间:%fs  最终位置差:%f\n', N /Fs,  norm(pos_gt(N, :) - pos(N, :)));
+fprintf('总时间:%fs  最终位置差:%f\n', N /Fs,  norm(pos_gt(N, :) - h_pos(N, :)));
