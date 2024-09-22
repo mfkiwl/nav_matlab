@@ -11,7 +11,7 @@ D2R = pi/180;       % Deg to Rad
 GRAVITY = 9.8;      % 重力加速度
 
 %%
-% bCn: b系到n系的旋转矩阵 Vn = bCn * Vb
+% Cb2n: b系到n系的旋转矩阵 Vn = Cb2n * Vb
 
 % 切换到当前工作目录
 scriptPath = mfilename('fullpath');
@@ -57,7 +57,7 @@ data.dev.lon = data.dev.ins_lon*D2R;
 % data.imu.acc(:,2) = data.imu.acc(:,2) + 0.1*GRAVITY;
 %  data.imu.gyr(:,3) = data.imu.gyr(:,3) + 0.5*D2R;
 att = [0 0 0]*D2R; %初始安装角
-Cbrv = att2Cnb(att);
+Cb2v_simulate = att2Cnb(att); % matlab仿真设置的安装角误差
 
 %定义变量
 ESKF156_FB_A = bitshift(1,0); %反馈失准角
@@ -174,8 +174,8 @@ yaw0 = opt.inital_yaw;
 pitch_sins = pitch0;
 roll_sins = roll0;
 yaw_sins = yaw0;
-nQb = angle2quat(-yaw0, pitch0, roll0, 'ZXY');
-nQb_sins = angle2quat(-yaw0, pitch0, roll0, 'ZXY');
+Qb2n = angle2quat(-yaw0, pitch0, roll0, 'ZXY');
+Qb2n_sins = angle2quat(-yaw0, pitch0, roll0, 'ZXY');
 vel = [0 0 0]';
 pos = [0 0 0]';
 
@@ -214,26 +214,25 @@ for i=inital_imu_idx:imu_len
     %% 捷联更新
     % 单子样等效旋转矢量法
     w_b = data.imu.gyr(i,:)';
-    w_b = Cbrv*w_b;
+    w_b = Cb2v_simulate*w_b;
     w_b = w_b - gyro_bias;
 
     f_b = data.imu.acc(i,:)';
-    f_b = Cbrv*f_b;
+    f_b = Cb2v_simulate*f_b;
     f_b = f_b - acc_bias;
 
     % 捷联更新
-    [nQb, pos, vel, ~] = ins(w_b, f_b, nQb, pos, vel, GRAVITY, imu_dt);
+    [Qb2n, pos, vel, ~] = ins(w_b, f_b, Qb2n, pos, vel, GRAVITY, imu_dt);
 
     % 纯捷联姿态
-    [nQb_sins, ~, ~, ~] = ins(w_b, f_b, nQb_sins, pos, vel, GRAVITY, imu_dt);
+    [Qb2n_sins, ~, ~, ~] = ins(w_b, f_b, Qb2n_sins, pos, vel, GRAVITY, imu_dt);
 
-    bQn = ch_qconj(nQb); %更新bQn
-    f_n = ch_qmulv(nQb, f_b);
+    f_n = ch_qmulv(Qb2n, f_b);
     a_n = f_n + [0; 0; -GRAVITY];
-    bCn = ch_q2m(nQb); %更新bCn阵
-    nCb = bCn'; %更新nCb阵
+    Cb2n = ch_q2m(Qb2n); %更新Cb2n阵
+    Cn2b = Cb2n'; %更新Cn2b阵
 
-    log.vb(i, :) = (nCb * vel)';
+    log.vb(i, :) = (Cn2b * vel)';
 
     %% 卡尔曼滤波
     F = zeros(N);
@@ -244,8 +243,8 @@ for i=inital_imu_idx:imu_len
     F(6,1) = -f_n(2); %f_n北向比力
     F(6,2) = f_n(1); %f_e东向比力
     F(7:9, 4:6) = eye(3);
-    F(1:3, 10:12) = -bCn;
-    F(4:6, 13:15) =  bCn;
+    F(1:3, 10:12) = -Cb2n;
+    F(4:6, 13:15) =  Cb2n;
 
     % 状态转移矩阵F离散化
     F = eye(N) + F*imu_dt;
@@ -272,14 +271,14 @@ for i=inital_imu_idx:imu_len
             Hvel(1:3, 4:6) = eye(3);
             Zvel = vel - data.gnss.vel_enu(gnss_idx,:)';
             Zvel = Zvel - a_n*opt.gnss_delay; % GNSS量测延迟补偿
-            Zvel = Zvel - (-bCn*v3_skew(w_b))*opt.gnss_lever_arm; % GNSS天线杆壁效应补偿
+            Zvel = Zvel - (-Cb2n*v3_skew(w_b))*opt.gnss_lever_arm; % GNSS天线杆壁效应补偿
 
             Hpos = zeros(3,N);
             Hpos(1:3, 7:9) = eye(3);
             Zpos = pos - gnss_enu(gnss_idx,:)';
 
             Zpos = Zpos - vel*opt.gnss_delay; % GNSS量测延迟补偿
-            Zpos = Zpos - (-bCn)*opt.gnss_lever_arm; % GNSS天线杆壁效应补偿
+            Zpos = Zpos - (-Cb2n)*opt.gnss_lever_arm; % GNSS天线杆壁效应补偿
 
             if (opt.gnss_outage == 0 || (opt.gnss_outage == 1 && (current_time < opt.outage_start || current_time > opt.outage_stop))) ...
                     && (current_time - last_gnss_fusion_time >= opt.gnss_min_interval)
@@ -330,9 +329,9 @@ for i=inital_imu_idx:imu_len
         if opt.nhc_enable
             H = zeros(2,N);
             A = [1 0 0; 0 0 1];
-            H(:,4:6) = A*nCb;
+            H(:,4:6) = A*Cn2b;
             %  bCm = ch_eul2m([-X(16), 0, -X(17)]);
-            Z = 0 + (A*nCb)*vel;
+            Z = 0 + (A*Cn2b)*vel;
             R = diag(ones(1, size(H, 1))*opt.nhc_R)^2;
 
             % 卡尔曼量测更新
@@ -346,15 +345,15 @@ for i=inital_imu_idx:imu_len
 %             FB_BIT = bitor(FB_BIT, ESKF156_FB_W);
         end
         %         else % GNSS 有效
-        %             M = nCb * v3_skew(vel);
-        %             % M = nCb * v3_skew(data.gnss.vel_enu(gnss_idx,:));
+        %             M = Cn2b * v3_skew(vel);
+        %             % M = Cn2b * v3_skew(data.gnss.vel_enu(gnss_idx,:));
         %             H = zeros(2, N);
         %
         %             H(1, 1:3) = - M(1,:);
-        %             H(1, 4:6) = nCb(1,:);
+        %             H(1, 4:6) = Cn2b(1,:);
         %             H(1, 17)  = -norm(log.vb(i,:));
         %             H(2, 1:3) = - M(3,:);
-        %             H(2, 4:6) = nCb(3,:);
+        %             H(2, 4:6) = Cn2b(3,:);
         %             H(2, 16)  = norm(log.vb(i,:));
         %
         %             Z = log.vb(i, [1, 3])';
@@ -377,11 +376,10 @@ for i=inital_imu_idx:imu_len
         rv_norm = norm(rv);
         if rv_norm > 0
             qe = [cos(rv_norm/2); sin(rv_norm/2)*rv/rv_norm]';
-            nQb = ch_qmul(qe, nQb);
-            nQb = ch_qnormlz(nQb); %单位化四元数
-            bQn = ch_qconj(nQb); %更新bQn
-            bCn = ch_q2m(nQb); %更新bCn阵
-            nCb = bCn'; %更新nCb阵
+            Qb2n = ch_qmul(qe, Qb2n);
+            Qb2n = ch_qnormlz(Qb2n); %单位化四元数
+            Cb2n = ch_q2m(Qb2n); %更新Cb2n阵
+            Cn2b = Cb2n'; %更新Cn2b阵
             X(1:3) = 0;
         end
 
@@ -410,7 +408,7 @@ for i=inital_imu_idx:imu_len
 
 
     %% 信息存储
-    [pitch, roll, yaw] = q2att(nQb);
+    [pitch, roll, yaw] = q2att(Qb2n);
     log.pitch(i,:) = pitch;
     log.roll(i,:) = roll;
     log.yaw(i,:) = yaw;
@@ -424,7 +422,7 @@ for i=inital_imu_idx:imu_len
     log.tow(i,:) = current_time;
 
     % 纯惯性信息存储
-    [pitch_sins, roll_sins, yaw_sins] = q2att(nQb_sins);
+    [pitch_sins, roll_sins, yaw_sins] = q2att(Qb2n_sins);
     log.sins_att(i,:) = [pitch_sins roll_sins yaw_sins];
 end
 

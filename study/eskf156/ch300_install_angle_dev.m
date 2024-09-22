@@ -11,7 +11,7 @@ D2R = pi/180;       % Deg to Rad
 GRAVITY = 9.8;      % 重力加速度
 
 %%
-% bCn: b系到n系的旋转矩阵 Vn = bCn * Vb
+% Cb2n: b系到n系的旋转矩阵 Vn = Cb2n * Vb
 
 % 切换到当前工作目录
 scriptPath = mfilename('fullpath');
@@ -19,32 +19,7 @@ scriptFolder = fileparts(scriptPath);
 cd(scriptFolder);
 
 %% 数据载入
-% load('dataset/240706_B/240706_B.mat');
-% load('dataset/240710_A1/240710_A1.mat');
- % load('dataset/240710_A2/240710_A2.mat');
- % load('dataset/240710_B1/240710_B1.mat');
- %  load('dataset/240711A1/240711A1.mat');
-  % load('dataset/240711A3/240711A3.mat');
- %  load('dataset/240712A1/240712A1.mat');
- %  load('dataset/240712D2/240712D2.mat');
-%  load('dataset/240718A1/240718A1.mat');
-
- % load('dataset/240718A3/240718A3.mat');
-% load('dataset/240718B1/240718B1.mat');
-% load('dataset/240718B2/240718B2.mat');
-%load('dataset/240726B2里程计/240726B2里程计.mat');
-% load('dataset/240727B1CAN/240727B1CAN.mat');
-% load('dataset/240727B2/240727B2.mat');
-% load('dataset/240805A/240805A1.mat');
-%   load('dataset/240816A/240816A1.mat');
-  %load('dataset/240821C1/240821C1.mat');
-
-
- % load('dataset/240826A2/240826A2.mat');
- %load('dataset/240718A2/240718A2.mat');
- %load('dataset/240912B1/240912B1.mat');
- load('dataset/240913B/240913B.mat');
- 
+load('dataset\240922\240922B3.mat');
 
 %单位国际化
 data.imu.acc =  data.imu.acc*GRAVITY;
@@ -59,8 +34,8 @@ data.dev.lon = data.dev.ins_lon*D2R;
 % data.imu.gyr(:,3) = data.imu.gyr(:,3) + 0.5*D2R;
 
 att = [0 0 0]*D2R; %初始安装角
-Cbrv = att2Cnb(att);%% from v to b 
-bCv = Cbrv;% Cvb :b as subscript;v as superscript
+Cb2v_simulate = att2Cnb(att); % matlab仿真设置的安装角误差
+Cb2v = eye(3);
 
 %定义变量
 ESKF156_FB_A = bitshift(1,0); %反馈失准角
@@ -75,21 +50,30 @@ gnss_lost_elapsed = 0;
 gnss_last_valid_time = 0;
 chi_lambda_vel = 999;
 chi_lambda_pos = 999;
+zupt_detect_time = 0;
+is_zupt = 0;
 %% 说明
 % KF 状态量: 失准角(3) 速度误差(3) 位置误差(3) 陀螺零偏(3) 加计零偏(3)
 
 %% 相关选项及参数设置
 opt.alignment_time = 1;          % 初始对准时间(s)
 opt.gnss_outage = 0;             % 模拟GNSS丢失
-opt.outage_start = 700;         % 丢失开始时间(s)
-opt.outage_stop = 1000;          % 丢失结束时间(s)
+opt.outage_start = 600;         % 丢失开始时间(s)
+opt.outage_stop = 700;          % 丢失结束时间(s)
 opt.nhc_enable = 1;              % 车辆运动学约束
 opt.nhc_lever_arm = 0*[0.35,0.35,-1.35]; %nhc杆臂长度 b系下（右-前-上）240816测试杆臂,仅测试天向，其他两轴为目测值
-opt.nhc_R = 1.0;                % 车载非完整性约束噪声
+opt.nhc_R = 3;                % 车载非完整性约束噪声
 opt.gnss_min_interval = 0;    % 设定时间间隔，例如0.5秒
 opt.gnss_delay = 0;              % GNSS量测延迟 sec
 opt.gnss_lever_arm = 0*[0.45;0.45;-1.34]; %GNSS杆臂长度 b系下（右-前-上）240816测试杆臂
 opt.has_install_esti = 1;       %% can close or open ;1:esti insatllangle ; 0:no esti
+
+opt.zupt_enable = 1;              % 启用ZUPT
+opt.zupt_vel_threshold = 2.5;     % ZUPT速度阈值(m/s)
+opt.zupt_gyr_threshold = 0.5*D2R; % ZUPT角速度阈值(rad/s)
+opt.zupt_time_threshold = 1.0;    % ZUPT持续时间阈值(s)
+opt.zupt_R = diag([0.1, 0.1, 0.1].^2); % ZUPT测量噪声协方差
+
 % 初始状态方差:    姿态       ENU速度  水平位置      陀螺零偏                加速度计零偏        安装俯仰角 安装航向角
 opt.P0 = diag([[2 2 10]*D2R, [1 1 1], [5 5 5], 0.1*D2R*ones(1,3), 1e-2*GRAVITY*ones(1,3), 2*D2R*ones(1,2) ])^2;
 N = length(opt.P0);
@@ -101,8 +85,6 @@ dev_len = length(data.dev.tow);
 
 imu_dt = mean(diff(data.imu.tow));
 gnss_dt = mean(diff(data.gnss.tow));
-
-opt.nhc_upd_TS = 1/imu_dt;       % NHC upd period maybe used inthe future, nhc upd period 
 
 % 开启静止时间
 indices = find(data.imu.tow <= opt.alignment_time);  % 找到在x_seconds时间范围内的所有索引
@@ -136,7 +118,7 @@ last_gnss_fusion_time = -inf;
 inital_gnss_idx = 1;
 % 根据速度 获得初始航向角
 for i=1:length(data.gnss.tow)
-    if norm(data.gnss.vel_enu(i,:)) > 1
+    if norm(data.gnss.vel_enu(i,:)) > 3
         opt.inital_yaw = atan2(data.gnss.vel_enu(i,1),data.gnss.vel_enu(i,2));
         if(opt.inital_yaw < 0)
             opt.inital_yaw =  opt.inital_yaw + 360*D2R;
@@ -180,8 +162,8 @@ yaw0 = opt.inital_yaw;
 pitch_sins = pitch0;
 roll_sins = roll0;
 yaw_sins = yaw0;
-nQb = angle2quat(-yaw0, pitch0, roll0, 'ZXY');
-nQb_sins = angle2quat(-yaw0, pitch0, roll0, 'ZXY');
+Qb2n = angle2quat(-yaw0, pitch0, roll0, 'ZXY');
+Qb2n_sins = angle2quat(-yaw0, pitch0, roll0, 'ZXY');
 vel = [0 0 0]';
 pos = [0 0 0]';
 
@@ -209,7 +191,7 @@ last_time = toc;
 gnss_idx = inital_gnss_idx;
 imucnt= 0;j=0;
 imu_after_cal = nan(imu_len, 7);
-% opt.nhc_enable = zeros(imu_len,1); %车辆运动学约束,后续需要记录用于对应发当前运动状态是否是判定准确
+
 for i=inital_imu_idx:imu_len
     imucnt=imucnt+1;
     FB_BIT = 0; %反馈标志
@@ -222,29 +204,28 @@ for i=inital_imu_idx:imu_len
     %% 捷联更新
     % 单子样等效旋转矢量法
     w_b = data.imu.gyr(i,:)';
-    w_b = Cbrv*w_b;
+    w_b = Cb2v_simulate*w_b;
     w_b = w_b - gyro_bias;
 
     f_b = data.imu.acc(i,:)';
-    f_b = Cbrv*f_b;
+    f_b = Cb2v_simulate*f_b;
     f_b = f_b - acc_bias;
-    
+
     j = j+1;
     imu_after_cal(j,:)=[data.imu.tow(i),w_b',f_b'];
 
     % 捷联更新
-    [nQb, pos, vel, ~] = ins(w_b, f_b, nQb, pos, vel, GRAVITY, imu_dt);
+    [Qb2n, pos, vel, ~] = ins(w_b, f_b, Qb2n, pos, vel, GRAVITY, imu_dt);
 
     % 纯捷联姿态
-    [nQb_sins, ~, ~, ~] = ins(w_b, f_b, nQb_sins, pos, vel, GRAVITY, imu_dt);
+    [Qb2n_sins, ~, ~, ~] = ins(w_b, f_b, Qb2n_sins, pos, vel, GRAVITY, imu_dt);
 
-    bQn = ch_qconj(nQb); %更新bQn
-    f_n = ch_qmulv(nQb, f_b);
+    f_n = ch_qmulv(Qb2n, f_b);
     a_n = f_n + [0; 0; -GRAVITY];
-    bCn = ch_q2m(nQb); %更新bCn阵
-    nCb = bCn'; %更新nCb阵
+    Cb2n = ch_q2m(Qb2n); %更新Cb2n阵
+    Cn2b = Cb2n'; %更新Cn2b阵
 
-    log.vb(i, :) = (nCb * vel)';
+    log.vb(i, :) = (Cn2b * vel)';
 
     %% 卡尔曼滤波
     F = zeros(N);
@@ -255,9 +236,9 @@ for i=inital_imu_idx:imu_len
     F(6,1) = -f_n(2); %f_n北向比力
     F(6,2) = f_n(1); %f_e东向比力
     F(7:9, 4:6) = eye(3);
-    F(1:3, 10:12) = -bCn;
-    F(4:6, 13:15) =  bCn;
-    F(16:17, 16:17) = -1/3600;%% 相关时间
+    F(1:3, 10:12) = -Cb2n;
+    F(4:6, 13:15) =  Cb2n;
+   % F(16:17, 16:17) = -1/3600;%% 相关时间
     % 状态转移矩阵F离散化
     F = eye(N) + F*imu_dt;
 
@@ -271,56 +252,53 @@ for i=inital_imu_idx:imu_len
     %% GNSS量测更新
     if gnss_idx <= length(data.gnss.tow) && abs(data.imu.tow(i) - data.gnss.tow(gnss_idx)) < 0.01 % threshold 是允许的最大差异
 
-        if data.gnss.solq_pos(gnss_idx) > 0 && data.gnss.gnss_pos_std_n(gnss_idx) < 10%%40
-            %gnss_vel_R = diag([0.1 0.1 0.1])^2;
-            % gnss_pos_R = diag([1.2 1.2 1.2])^2;
+        if data.gnss.solq_pos(gnss_idx) > 0
 
-            gnss_vel_R = diag(ones(3,1) * data.gnss.gnss_vel_std_n(gnss_idx))^2;
-            gnss_pos_R = diag(ones(3,1) * data.gnss.gnss_pos_std_n(gnss_idx))^2;
+            gnss_vel_R = diag(ones(3,1) * data.gnss.gnss_vel_std_n(gnss_idx))^2 * 1;
+            gnss_pos_R = diag(ones(3,1) * data.gnss.gnss_pos_std_n(gnss_idx))^2 * 1;
+
+            % gnss_vel_R = diag([0.1 0.1 0.1])^2;
+            % gnss_pos_R = diag([1.2 1.2 1.2])^2;
 
             Hvel = zeros(3,N);
             Hvel(1:3, 4:6) = eye(3);
             Zvel = vel - data.gnss.vel_enu(gnss_idx,:)';
             Zvel = Zvel - a_n*opt.gnss_delay; % GNSS量测延迟补偿
-            Zvel = Zvel + (-bCn*v3_skew(w_b))*opt.gnss_lever_arm; % GNSS天线杆壁效应补偿
+            Zvel = Zvel + (-Cb2n*v3_skew(w_b))*opt.gnss_lever_arm; % GNSS天线杆壁效应补偿
 
             Hpos = zeros(3,N);
             Hpos(1:3, 7:9) = eye(3);
             Zpos = pos - gnss_enu(gnss_idx,:)';
 
             Zpos = Zpos - vel*opt.gnss_delay; % GNSS量测延迟补偿
-            Zpos = Zpos + (-bCn)*opt.gnss_lever_arm; % GNSS天线杆壁效应补偿
+            Zpos = Zpos + (-Cb2n)*opt.gnss_lever_arm; % GNSS天线杆壁效应补偿
 
             if (opt.gnss_outage == 0 || (opt.gnss_outage == 1 && (current_time < opt.outage_start || current_time > opt.outage_stop))) ...
                     && (current_time - last_gnss_fusion_time >= opt.gnss_min_interval)
 
-                % Reference:  一种基于软卡方检测的自适应Ｋａｌｍａｎ滤波方法
+                % 速度位置更新：  Reference:  一种基于软卡方检测的自适应Ｋａｌｍａｎ滤波方法
                 A = Hvel * P * Hvel' + gnss_vel_R;
-                K = P * Hvel' / A;
-                innov = Zvel - Hvel * X;
+                Kvel = P * Hvel' / A;
+                innov_vel = Zvel - Hvel * X;
 
-                chi_lambda_vel = innov'*A^(-1)*innov;
+                chi_lambda_vel = innov_vel'*A^(-1)*innov_vel;
                 log.lambda_vel(gnss_idx, :) = chi_lambda_vel;
-                if(chi_lambda_vel < 1.5 || chi_lambda_pos < 0.15 || data.gnss.gnss_vel_std_n(gnss_idx) < 0.5 || data.gnss.gnss_pos_std_n(gnss_idx) < 5 || gnss_lost_elapsed > 3)
-%                 if (chi_lambda_vel < 1.5) && (data.gnss.gnss_vel_std_n(gnss_idx) < 1) && (data.gnss.hdop(gnss_idx) < 0.5) && (data.gnss.nv(gnss_idx) > 25)
-                    X = X + K * innov;
-                    P = (eye(N) - K * Hvel) * P;
-                    
-                    gnss_last_valid_time = data.gnss.tow(gnss_idx);
-                end
 
                 % 位置更新
                 A = Hpos * P * Hpos' + gnss_pos_R;
-                K = P * Hpos' / (A);
-                innov = Zpos - Hpos * X;
+                Kpos = P * Hpos' / (A);
+                innov_pos = Zpos - Hpos * X;
 
-                chi_lambda_pos = innov'*A^(-1)*innov;
+                chi_lambda_pos = innov_pos'*A^(-1)*innov_pos;
                 log.lambda_pos(gnss_idx, :) = chi_lambda_pos;
+                
+                if((chi_lambda_vel < 1.5 && chi_lambda_pos < 0.15) || (data.gnss.gnss_vel_std_n(gnss_idx) < 0.5 && data.gnss.gnss_pos_std_n(gnss_idx) < 5) || gnss_lost_elapsed > 3)
+                    X = X + Kvel * innov_vel;
+                    P = (eye(N) - Kvel * Hvel) * P;
 
-%                 if(chi_lambda_pos < 0.15 && data.gnss.gnss_pos_std_n(gnss_idx) < 4) && (data.gnss.hdop(gnss_idx) < 0.5 && data.gnss.nv(gnss_idx) > 25)
-                if(chi_lambda_vel < 1.5 || chi_lambda_pos < 0.15 || data.gnss.gnss_vel_std_n(gnss_idx) < 0.5 || data.gnss.gnss_pos_std_n(gnss_idx) < 5 || gnss_lost_elapsed > 3)
-                    X = X + K * innov;
-                    P = (eye(N) - K * Hpos) * P;
+                    X = X + Kpos * innov_pos;
+                    P = (eye(N) - Kpos * Hpos) * P;
+
                     gnss_last_valid_time = data.gnss.tow(gnss_idx);
                 end
 
@@ -329,7 +307,7 @@ for i=inital_imu_idx:imu_len
                 FB_BIT = bitor(FB_BIT, ESKF156_FB_P);
                 FB_BIT = bitor(FB_BIT, ESKF156_FB_G);
                 FB_BIT = bitor(FB_BIT, ESKF156_FB_W);
-
+                
                 % 更新上一次融合的时间
                 last_gnss_fusion_time = current_time;
             end
@@ -338,63 +316,99 @@ for i=inital_imu_idx:imu_len
     end
 
     %% NHC 约束
-%     if norm(vel) > 0.1 && gnss_lost_elapsed > 1 && norm(w_b) < 20*D2R
-if(opt.nhc_enable)
-    if norm(vel) > 0.2 && norm(w_b) < 10*D2R
-%         if opt.nhc_enable
-%             H = zeros(2,N);
-%             A = [1 0 0; 0 0 1];
-%             H(:,4:6) = A*nCb;
-%             %  bCm = ch_eul2m([-X(16), 0, -X(17)]);
-%             Z = 0 + (A*nCb)*vel;
-%             R = diag(ones(1, size(H, 1))*opt.nhc_R)^2;
-% 
-%             % 卡尔曼量测更新
-%             K = P * H' / (H * P * H' + R);
-%             X = X + K * (Z - H * X);
-%             P = (eye(N) - K * H) * P;
-%             FB_BIT = bitor(FB_BIT, ESKF156_FB_A);
-%             FB_BIT = bitor(FB_BIT, ESKF156_FB_V);
-%             FB_BIT = bitor(FB_BIT, ESKF156_FB_P);
-%         end
-              %  else % GNSS 有效
-              %% v frame 速度误差作为安装角估计的量测方程 [Vvx_ins,Vvy_ins,Vvz_ins]=dVv = Vv'-Vv = -Cb2v*Cn2b*v3_skew(Vn)*dphi + v3_skew(Cb2v*Cn2b*Vn)*dinstallangle + Cb2v*Cn2b*dVn
-              %% paper ref:车载MIMUGNSS组合高精度无缝导航关键技术研究--sunzhenqian
-                    if (~opt.has_install_esti)
-                       bCv = eye(3);
-                    end
-                    M1 = - bCv * nCb * v3_skew(vel);% v frame vel
-                    % M = nCb * v3_skew(data.gnss.vel_enu(gnss_idx,:));
-                    M2 = bCv * nCb;%M2 = Cb2v*Cn2b
-                    M3 = v3_skew(bCv * log.vb(i,:)');% M3=v3_skew(Cb2v*Cn2b*Vn)
-                    H = zeros(2, N);
-        
-                    H(1, 1:3) = M1(1,:);
-                    H(1, 4:6) = M2(1,:);
-                    H(1, 17)  = M3(1,3);
-                    H(2, 1:3) = M1(3,:);
-                    H(2, 4:6) = M2(3,:);
-                    H(2, 16)  = M3(3,1);
-        
-                    Vn2v_sins = bCv * log.vb(i, 1:3)';
+    if(opt.nhc_enable)
+        norm_vel = norm(vel);
 
-                    Z = Vn2v_sins([1,3]);
-        
-                    R = diag(ones(1, size(H, 1))*opt.nhc_R)^2;
-        
-                    % 卡尔曼量测更新
-                    K = P * H' / (H * P * H' + R);
-                    X = X + K * (Z - H * X);
-                    P = (eye(N) - K * H) * P;
-                    FB_BIT = bitor(FB_BIT, ESKF156_FB_A);
-                    FB_BIT = bitor(FB_BIT, ESKF156_FB_V);
-                    if (opt.has_install_esti)
-                       FB_BIT = bitor(FB_BIT, ESKF156_FB_CBV);
-                    end
-                    
-               %  end
+        if norm_vel > 0.2 && norm(w_b) < 20*D2R
+            if gnss_lost_elapsed > 0.5
+                H = zeros(2,N);
+                A = [1 0 0; 0 0 1];
+                H(:,4:6) = A*Cb2v*Cn2b;
+                Z = 0 + (A*Cb2v*Cn2b)*vel;
+                R = diag(ones(1, size(H, 1))*opt.nhc_R)^2;
+
+                % 卡尔曼量测更新
+                K = P * H' / (H * P * H' + R);
+                X = X + K * (Z - H * X);
+                P = (eye(N) - K * H) * P;
+                FB_BIT = bitor(FB_BIT, ESKF156_FB_A);
+                FB_BIT = bitor(FB_BIT, ESKF156_FB_V);
+            else
+                %% v frame 速度误差作为安装角估计的量测方程 [Vvx_ins,Vvy_ins,Vvz_ins]=dVv = Vv'-Vv = -Cb2v*Cn2b*v3_skew(Vn)*dphi + v3_skew(Cb2v*Cn2b*Vn)*dinstallangle + Cb2v*Cn2b*dVn
+                %% paper ref:车载MIMUGNSS组合高精度无缝导航关键技术研究--sunzhenqian
+                if (~opt.has_install_esti)
+                    Cb2v = eye(3);
+                end
+                M1 = - Cb2v * Cn2b * v3_skew(vel);% v frame vel
+                % M = Cn2b * v3_skew(data.gnss.vel_enu(gnss_idx,:));
+                M2 = Cb2v * Cn2b;%M2 = Cb2v*Cn2b
+                M3 = v3_skew(Cb2v * log.vb(i,:)');% M3=v3_skew(Cb2v*Cn2b*Vn)
+                H = zeros(2, N);
+
+                H(1, 1:3) = M1(1,:);
+                H(1, 4:6) = M2(1,:);
+                H(1, 17)  = M3(1,3);
+                H(2, 1:3) = M1(3,:);
+                H(2, 4:6) = M2(3,:);
+                H(2, 16)  = M3(3,1);
+
+                Vn2v_sins = Cb2v * log.vb(i, 1:3)';
+
+                Z = Vn2v_sins([1,3]);
+
+                R = diag(ones(1, size(H, 1))*opt.nhc_R)^2;
+
+                % 卡尔曼量测更新
+                K = P * H' / (H * P * H' + R);
+                X = X + K * (Z - H * X);
+                P = (eye(N) - K * H) * P;
+
+                FB_BIT = bitor(FB_BIT, ESKF156_FB_A);
+                FB_BIT = bitor(FB_BIT, ESKF156_FB_V);
+                if (opt.has_install_esti)
+                    FB_BIT = bitor(FB_BIT, ESKF156_FB_CBV);
+                end
+            end
+        end
     end
-end
+
+    %% ZUPT检测和更新
+    if opt.zupt_enable
+        vel_norm = norm(vel);
+        gyr_norm = norm(w_b);
+
+        if vel_norm < opt.zupt_vel_threshold && gyr_norm < opt.zupt_gyr_threshold
+            zupt_detect_time = zupt_detect_time + imu_dt;
+            if zupt_detect_time >= opt.zupt_time_threshold
+                is_zupt = true;
+            end
+        else
+            zupt_detect_time = 0;
+            is_zupt = false;
+        end
+
+        if is_zupt
+            % ZUPT更新
+            is_zupt = false;
+            zupt_detect_time = 0;
+
+            H_zupt = zeros(3, N);
+            H_zupt(:, 4:6) = eye(3);  % 速度误差状态
+
+            z_zupt = vel;  % 观测值：当前速度（应该接近零）
+
+            % 卡尔曼滤波更新
+            K_zupt = P * H_zupt' / (H_zupt * P * H_zupt' + opt.zupt_R);
+            X = X + K_zupt * (z_zupt - H_zupt * X);
+            P = (eye(N) - K_zupt * H_zupt) * P;
+            
+            FB_BIT = bitor(FB_BIT, ESKF156_FB_V);
+
+        end
+    end
+
+
+
     % 状态暂存
     X_temp = X;
 
@@ -403,11 +417,10 @@ end
         rv_norm = norm(rv);
         if rv_norm > 0
             qe = [cos(rv_norm/2); sin(rv_norm/2)*rv/rv_norm]';
-            nQb = ch_qmul(qe, nQb);
-            nQb = ch_qnormlz(nQb); %单位化四元数
-            bQn = ch_qconj(nQb); %更新bQn
-            bCn = ch_q2m(nQb); %更新bCn阵
-            nCb = bCn'; %更新nCb阵
+            Qb2n = ch_qmul(qe, Qb2n);
+            Qb2n = ch_qnormlz(Qb2n); %单位化四元数
+            Cb2n = ch_q2m(Qb2n); %更新Cb2n阵
+            Cn2b = Cb2n'; %更新Cn2b阵
             X(1:3) = 0;
         end
 
@@ -436,15 +449,15 @@ end
 
     if bitand(FB_BIT, ESKF156_FB_CBV)
         cvv = att2Cnb([X(16),0,X(17)]);
-        bCv = cvv*bCv;
+        Cb2v = cvv*Cb2v;
         X(16:17) = 0;
-        att = m2att(bCv);        
+        att = m2att(Cb2v);
     end
-    
+
 
 
     %% 信息存储
-    [pitch, roll, yaw] = q2att(nQb);
+    [pitch, roll, yaw] = q2att(Qb2n);
     log.pitch(i,:) = pitch;
     log.roll(i,:) = roll;
     log.yaw(i,:) = yaw;
@@ -458,7 +471,7 @@ end
     log.tow(i,:) = current_time;
 
     % 纯惯性信息存储
-    [pitch_sins, roll_sins, yaw_sins] = q2att(nQb_sins);
+    [pitch_sins, roll_sins, yaw_sins] = q2att(Qb2n_sins);
     log.sins_att(i,:) = [pitch_sins roll_sins yaw_sins];
 end
 imu_after_cal(j+1:end,:) = [];
@@ -483,136 +496,50 @@ set(groot, 'defaultAxesZGrid', 'on');
 % xlim([data.imu.tow(1) data.imu.tow(end)]);
 % set(gcf, 'Units', 'normalized', 'Position', [0.025, 0.05, 0.95, 0.85]);
 
-%% 位置
-figure('name', '位置');
-subplot(2,3,1);
-plot(data.imu.tow, log.pos(:,1), '.-'); hold on;
-plot(data.imu.tow, data.dev.pos_enu(:,1), '.-');hold on;
-title('Pos East'); xlabel('时间(s)'); ylabel('m'); legend('MATLAB','DEV'); xlim tight;
-subplot(2,3,4);
-plot(data.imu.tow, log.P(:,7), '.-'); hold on;
-plot(data.imu.tow, data.dev.kf_p_pos(:,1), '.-');
-title('Pos East Std'); xlabel('时间(s)'); ylabel('m'); legend('MATLAB','DEV'); xlim tight;
+navigation_plots.axis_comparison('XLabel', '时间(s)', ...
+                                      'YLabel', {{'East (m)', 'North (m)', 'Up (m)'}, {'Std East (m)', 'Std North (m)', 'Std Up (m)'}}, ...
+                                      'Title', '位置对比', ...
+                                      'Time', {data.imu.tow, data.imu.tow, data.imu.tow, data.imu.tow}, ...
+                                      'Values', {log.pos, data.dev.pos_enu, log.P(:,7:9), data.dev.kf_p_pos}, ...
+                                      'Labels', {'Matlab', 'HI30', 'Matlab_P', 'HI30_P'}, ...
+                                      'Subplots', [1, 1, 2, 2]);
 
-subplot(2,3,2);
-plot(data.imu.tow, log.pos(:,2), '.-'); hold on;
-plot(data.imu.tow, data.dev.pos_enu(:,2), '.-');
-title('Pos North'); xlabel('时间(s)'); ylabel('m'); legend('MATLAB','DEV'); xlim tight;
-subplot(2,3,5);
-plot(data.imu.tow, log.P(:,8), '.-'); hold on;
-plot(data.imu.tow, data.dev.kf_p_pos(:,2), '.-');
-title('Pos North Std'); xlabel('时间(s)'); ylabel('m'); legend('MATLAB','DEV'); xlim tight;
 
-subplot(2,3,3);
-plot(data.imu.tow, log.pos(:,3), '.-'); hold on;
-plot(data.imu.tow, data.dev.pos_enu(:,3), '.-');
-title('Pos Up'); xlabel('时间(s)'); ylabel('m'); legend('MATLAB','DEV'); xlim tight;
-subplot(2,3,6);
-plot(data.imu.tow, log.P(:,9), '.-'); hold on;
-plot(data.imu.tow, data.dev.kf_p_pos(:,3), '.-');
-title('Pos Up Std'); xlabel('时间(s)'); ylabel('m'); legend('MATLAB','DEV'); xlim tight;
+navigation_plots.axis_comparison('XLabel', '时间(s)', ...
+                                      'YLabel', {{'East (m/s)', 'North (m/s)', 'Up (m/s)'}, {'Std East (m/s)', 'Std North (m/s)', 'Std Up (m/s)'}}, ...
+                                      'Title', '速度对比', ...
+                                      'Time', {data.imu.tow, data.imu.tow, data.imu.tow, data.imu.tow}, ...
+                                      'Values', {log.vel, data.dev.vel_enu, log.P(:,4:6), data.dev.kf_p_vel}, ...
+                                      'Labels', {'Matlab', 'HI30', 'Matlab_P', 'HI30_P'}, ...
+                                      'Subplots', [1, 1, 2, 2]);
 
-set(gcf, 'Units', 'normalized', 'Position', [0.025, 0.05, 0.95, 0.85]);
+navigation_plots.axis_comparison('XLabel', '时间(s)', ...
+                                      'YLabel', {{'Roll (deg)', 'Pitch (deg)', 'Yaw (deg)'}, {'Std Roll (deg)', 'Std Pitch (deg)', 'Std Yaw (deg)'}}, ...
+                                      'Title', '姿态对比', ...
+                                      'Time', {data.imu.tow, data.imu.tow, data.imu.tow, data.imu.tow}, ...
+                                      'Values', {[log.roll log.pitch log.yaw], [data.dev.roll data.dev.pitch data.dev.yaw], log.P(:,1:3)*R2D, data.dev.kf_p_att}, ...
+                                      'Labels', {'Matlab', 'HI30', 'Matlab_P', 'HI30_P'}, ...
+                                      'Subplots', [1, 1, 2, 2]);
 
-%% 速度
-figure('name', '速度');
-subplot(2,3,1);
-plot(data.imu.tow, log.vel(:,1), '.-'); hold on;
-plot(data.imu.tow, data.dev.vel_enu(:,1), '.-');
-title('Vel East'); xlabel('时间(s)'); ylabel('m'); legend('MATLAB','DEV'); xlim tight;
-subplot(2,3,4);
-plot(data.imu.tow, log.P(:,4), '.-'); hold on;
-plot(data.imu.tow, data.dev.kf_p_vel(:,1), '.-');
-title('Vel East Std'); xlabel('时间(s)'); ylabel('m'); legend('MATLAB','DEV'); xlim tight;
 
-subplot(2,3,2);
-plot(data.imu.tow, log.vel(:,2), '.-'); hold on;
-plot(data.imu.tow, data.dev.vel_enu(:,2), '.-');
-title('Vel North'); xlabel('时间(s)'); ylabel('m'); legend('MATLAB','DEV'); xlim tight;
-subplot(2,3,5);
-plot(data.imu.tow, log.P(:,5), '.-'); hold on;
-plot(data.imu.tow, data.dev.kf_p_vel(:,2), '.-');
-title('Vel North Std'); xlabel('时间(s)'); ylabel('m'); legend('MATLAB','DEV'); xlim tight;
+navigation_plots.axis_comparison('XLabel', '时间(s)', ...
+                                      'YLabel', {{'X (deg)', 'Y (deg)', 'Z (deg)'}, {'Std X (deg)', 'Std Y (deg)', 'Std Z (deg)'}}, ...
+                                      'Title', '陀螺零偏对比', ...
+                                      'Time', {data.imu.tow, data.imu.tow, data.imu.tow, data.imu.tow, data.imu.tow}, ...
+                                      'Values', {log.gyro_bias*R2D, repmat(gyr_bias0*R2D, length(data.imu.tow), 1), data.dev.kf_wb*R2D, log.P(:, 10:12)*R2D, data.dev.kf_p_wb*R2D}, ...
+                                      'Labels', {'Matlab', 'bias0', 'HI30', 'Matlab_P', 'HI30_P'}, ...
+                                      'Subplots', [1, 1, 1, 2, 2], ...
+                                      'LineStyles', {'-', '-.', ':', '-'});
 
-subplot(2,3,3);
-plot(data.imu.tow, log.vel(:,3), '.-'); hold on;
-plot(data.imu.tow, data.dev.vel_enu(:,3), '.-');
-title('Vel Up'); xlabel('时间(s)'); ylabel('m'); legend('MATLAB','DEV'); xlim tight;
-subplot(2,3,6);
-plot(data.imu.tow, log.P(:,6), '.-'); hold on;
-plot(data.imu.tow, data.dev.kf_p_vel(:,3), '.-');
-title('Vel Up Std'); xlabel('时间(s)'); ylabel('m'); legend('MATLAB','DEV'); xlim tight;
+navigation_plots.axis_comparison('XLabel', '时间(s)', ...
+                                      'YLabel', {{'X (mG)', 'Y (mG)', 'Z (mG)'}, {'Std X (mG)', 'Std Y (mG)', 'Std Z (mG)'}}, ...
+                                      'Title', '加计零偏对比', ...
+                                      'Time', {data.imu.tow, data.imu.tow, data.imu.tow, data.imu.tow, data.imu.tow}, ...
+                                      'Values', {log.acc_bias*1000/GRAVITY, data.dev.kf_gb*1000/GRAVITY, log.P(:, 13:15)*1000/GRAVITY, data.dev.kf_p_gb*1000/GRAVITY}, ...
+                                      'Labels', {'Matlab', 'HI30', 'Matlab_P', 'HI30_P'}, ...
+                                      'Subplots', [1, 1, 2, 2]);
 
-set(gcf, 'Units', 'normalized', 'Position', [0.025, 0.05, 0.95, 0.85]);
 
-%%  姿态
-figure('name', '姿态');
-subplot(2,3,1);
-plot(data.imu.tow, log.roll, '.-'); hold on;
-plot(data.imu.tow, data.dev.roll, '.-');
-title('Roll'); xlabel('时间(s)'); ylabel('deg'); legend('MATLAB','DEV'); xlim tight;
-subplot(2,3,4);
-plot(data.imu.tow, log.P(:,1)*R2D, '.-'); hold on;
-plot(data.imu.tow, data.dev.kf_p_att(:,1), '.-');
-title('Roll Std'); xlabel('时间(s)'); ylabel('deg'); legend('MATLAB','DEV'); xlim tight;
-
-subplot(2,3,2);
-plot(data.imu.tow, log.pitch, '.-'); hold on;
-plot(data.imu.tow, data.dev.pitch, '.-');
-title('Pitch'); xlabel('时间(s)'); ylabel('deg'); legend('MATLAB','DEV'); xlim tight;
-subplot(2,3,5);
-plot(data.imu.tow, log.P(:,2)*R2D, '.-'); hold on;
-plot(data.imu.tow, data.dev.kf_p_att(:,2), '.-');
-title('Pitch Std'); xlabel('时间(s)'); ylabel('deg'); legend('MATLAB','DEV'); xlim tight;
-
-subplot(2,3,3);
-plot(data.imu.tow, log.yaw(:,1), '.-'); hold on;
-plot(data.imu.tow, data.dev.yaw, '.-');
-title('Yaw'); xlabel('时间(s)'); ylabel('deg'); legend('MATLAB','DEV'); xlim tight;
-subplot(2,3,6);
-plot(data.imu.tow, log.P(:,3)*R2D, '.-'); hold on;
-plot(data.imu.tow, data.dev.kf_p_att(:,3), '.-');
-title('Yaw Std'); xlabel('时间(s)'); ylabel('deg'); legend('MATLAB','DEV'); xlim tight;
-
-set(gcf, 'Units', 'normalized', 'Position', [0.025, 0.05, 0.95, 0.85]);
-
-%% IMU零偏估计曲线
-figure('name', 'IMU零偏估计曲线');
-subplot(2,2,1);
-color_rgb = get(gca,'ColorOrder');
-plot(data.imu.tow, log.gyro_bias(:, 1)  * R2D, 'Color', color_rgb(1,:), 'linewidth', 1.5); hold on;
-plot(data.imu.tow, log.gyro_bias(:, 2)  * R2D, 'Color', color_rgb(2,:), 'linewidth', 1.5);
-plot(data.imu.tow, log.gyro_bias(:, 3)  * R2D, 'Color', color_rgb(3,:), 'linewidth', 1.5);
-plot(data.imu.tow, data.dev.kf_wb(:, 1)  * R2D, '-', 'Color', color_rgb(1,:), 'linewidth', 0.5);
-plot(data.imu.tow, data.dev.kf_wb(:, 2)  * R2D, '-', 'Color', color_rgb(2,:), 'linewidth', 0.5);
-plot(data.imu.tow, data.dev.kf_wb(:, 3)  * R2D, '-', 'Color', color_rgb(3,:), 'linewidth', 0.5);
-plot(data.imu.tow, gyr_bias0(1)  * R2D * ones(imu_len,1), '-.', 'Color', color_rgb(1,:), 'linewidth', 0.3);
-plot(data.imu.tow, gyr_bias0(2)  * R2D * ones(imu_len,1), '-.', 'Color', color_rgb(2,:), 'linewidth', 0.3);
-plot(data.imu.tow, gyr_bias0(3)  * R2D * ones(imu_len,1), '-.', 'Color', color_rgb(3,:), 'linewidth', 0.3);
-xlim tight;
-title('GYR零偏估计曲线'); xlabel('时间(s)'); ylabel('零偏(dps)'); legend('MATLAB_X', 'MATLAB_Y', 'MATLAB_Z', 'Dev_X', 'Dev_Y', 'Dev_Z');
-
-subplot(2,2,2);
-plot(data.imu.tow, log.acc_bias(:, 1) / GRAVITY * 1000, 'Color', color_rgb(1,:), 'linewidth', 1.5); hold on;
-plot(data.imu.tow, log.acc_bias(:, 2) / GRAVITY * 1000, 'Color', color_rgb(2,:), 'linewidth', 1.5);
-plot(data.imu.tow, log.acc_bias(:, 3) / GRAVITY * 1000, 'Color', color_rgb(3,:), 'linewidth', 1.5);
-plot(data.imu.tow, data.dev.kf_gb(:, 1) / GRAVITY * 1000, '-', 'Color', color_rgb(1,:), 'linewidth', 0.5);
-plot(data.imu.tow, data.dev.kf_gb(:, 2) / GRAVITY * 1000, '-', 'Color', color_rgb(2,:), 'linewidth', 0.5);
-plot(data.imu.tow, data.dev.kf_gb(:, 3) / GRAVITY * 1000, '-', 'Color', color_rgb(3,:), 'linewidth', 0.5);
-xlim tight;
-title('ACC零偏估计曲线'); xlabel('时间(s)'); ylabel('零偏(mg)'); legend('MATLAB_X', 'MATLAB_Y', 'MATLAB_Z', 'Dev_X', 'Dev_Y', 'Dev_Z');
-
-subplot(2,2,3);
-semilogy(data.imu.tow, log.P(:, 10:12)  * R2D, 'linewidth', 1.5); grid on;
-xlim tight;
-title('GYR零偏协方差收敛曲线(MATLAB)'); xlabel('时间(s)'); ylabel('零偏标准差(dps)'); legend('X', 'Y', 'Z');
-
-subplot(2,2,4);
-semilogy(data.imu.tow, log.P(:, 13:15) / 9.8 * 1000, 'linewidth', 1.5); grid on;
-xlim tight;
-title('加速度计零偏协方差收敛曲线'); xlabel('时间(s)'); ylabel('零偏标准差(mg)'); legend('X', 'Y', 'Z');
-
-set(gcf, 'Units', 'normalized', 'Position', [0.025, 0.05, 0.95, 0.85]);
 
 %% 状态量曲线
 figure('name','状态量曲线');
@@ -687,22 +614,14 @@ xlabel('时间(s)'); ylabel('航向安装角(°)'); xlim tight;
 subplot(2,2,4);
 plot(data.imu.tow, log.P(:, 17)*R2D, 'LineWidth', 1.5); grid on;
 xlabel('时间(s)'); ylabel('航向安装角方差(°)'); xlim tight;
-% 
+%
 % subplot(111);
 % plot(data.imu.tow, log.installangle(:,2), 'LineWidth', 1.5); grid on;
 % xlabel('时间(s)'); ylabel('滚动安装角(°)'); xlim tight;
 
 set(gcf, 'Units', 'normalized', 'Position', [0.025, 0.05, 0.95, 0.85]);
 
-%% 二维轨迹
-figure('name', '2D轨迹');
-plot_enu(gnss_enu);
-plot_enu(log.pos);
-plot_enu(dev_pos_enu);
-
-legend("GNSS", "MATLAB", "DEV嵌入式设备轨迹");
-axis equal;
-set(gcf, 'Units', 'normalized', 'Position', [0.025, 0.05, 0.95, 0.85]);
+navigation_plots.trajectory_2d_plot({gnss_enu, log.pos, dev_pos_enu}, {'GNSS', 'MATLAB', 'DEV嵌入式设备轨迹'});
 
 %% 数据统计
 time_duration = seconds(time_sum);
@@ -711,12 +630,4 @@ time_duration.Format = 'hh:mm:ss';
 fprintf('行驶时间: %s\n', char(time_duration));
 fprintf('行驶距离: %.3fkm\n', distance_sum/1000);
 fprintf('最高时速: %.3fkm/h\n', max(log.vel_norm)*3.6);
-
-
-% %% 转换为kml
-% [filepath, name, ~] = fileparts(scriptPath);
-% [lat, lon, h] = ch_ENU2LLA(log.pos(:,1),log.pos(:,2),log.pos(:,3),lat0, lon0, h0);
-% rgbColor = [255, 0, 0];
-% kmlFileName = fullfile(filepath, name + "_MATLAB.kml");
-% generateKmlFiles(kmlFileName, lat*R2D, lon*R2D, 20, rgbColor);
 
